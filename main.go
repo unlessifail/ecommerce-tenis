@@ -76,4 +76,5 @@ func main() {
 	// Exibindo os dados
 	fmt.Println("Produto:", produto)
 	fmt.Println("Usuário:", usuario)
+	fmt.Println("Pedido:", pedido)
 }
