@@ -116,34 +116,32 @@ func protected(w http.ResponseWriter, r *http.Request) {
 }
 
 func logout(w http.ResponseWriter, r *http.Request) {
-	if err := Authorize(r); err != nil {
-		er := http.StatusUnauthorized
-		http.Error(w, "Não autorizado.", er)
+
+	// Adquire o cookie
+	cookie, err := r.Cookie("session_token")
+	if err != nil {
+		http.Error(w, "Sem sessão ativa.", http.StatusUnauthorized)
 		return
 	}
 
-	// Limpar cookie
+	// Busca usuário pelo session_token
+	for username, user := range users {
+		if user.SessionToken == cookie.Value {
+
+			// Remove session token
+			user.SessionToken = ""
+			users[username] = user
+			break
+		}
+	}
+
+	// Expira o cookie
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
 		Value:    "",
-		Expires:  time.Now().Add(-time.Hour),
+		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
 	})
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session_token",
-		Value:    "",
-		Expires:  time.Now().Add(-time.Hour),
-		HttpOnly: false,
-	})
-
-	// Limpar cookies do banco de dados
-	username := r.FormValue("username")
-	user, _ := users[username]
-	user.SessionToken = ""
-	user.CSRFToken = ""
-	users[username] = user
-
-	fmt.Fprintln(w, "Desconectado com sucesso!")
-
+	fmt.Fprintln(w, "Logout realizado com sucesso.")
 }
