@@ -1,0 +1,149 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+)
+
+type Login struct {
+	HashedPassword string
+	SessionToken   string
+	CSRFToken      string
+}
+
+// Usuário
+
+var users = map[string]Login{}
+
+func main() {
+	http.HandleFunc("/register", register)
+	http.HandleFunc("/login", login)
+	http.HandleFunc("/logout", logout)
+	http.HandleFunc("/protected", protected)
+	http.ListenAndServe(":8080", nil)
+}
+
+func register(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		er := http.StatusMethodNotAllowed
+		http.Error(w, "Método Inválido", er)
+		return
+	}
+
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+	if len(username) < 8 || len(password) < 8 {
+		er := http.StatusNotAcceptable
+		http.Error(w, "Usuário ou senha inválidos", er)
+		return
+	}
+
+	if _, ok := users[username]; ok {
+		er := http.StatusConflict
+		http.Error(w, "Usuário existente", er)
+		return
+	}
+
+	hashedPassword, _ := hashPassword(password)
+	users[username] = Login{
+		HashedPassword: hashedPassword,
+	}
+
+	fmt.Fprintln(w, "Usuário registrado com sucesso!")
+
+}
+
+func login(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		er := http.StatusMethodNotAllowed
+		http.Error(w, "Método de solicitação inválido.", er)
+		return
+	}
+
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	user, ok := users[username]
+	if !ok || !checkPasswordHash(password, user.HashedPassword) {
+		er := http.StatusUnauthorized
+		http.Error(w, "Usuário ou senha incorretos.", er)
+		return
+	}
+
+	sessionToken := generateToken(32)
+	csrfToken := generateToken(32)
+
+	// Define cookie de sessão
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    sessionToken,
+		Expires:  time.Now().Add(24 * time.Hour),
+		HttpOnly: true,
+	})
+
+	// Define Token CSRF em um cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "csrf_token",
+		Value:    csrfToken,
+		Expires:  time.Now().Add(24 * time.Hour),
+		HttpOnly: false, // Precisa ser acessível no client-side
+	})
+
+	// Armazena tokens no banco de dados
+	user.SessionToken = sessionToken
+	users[username] = user
+
+	fmt.Fprintln(w, "Login realizado com sucesso!")
+
+}
+
+func protected(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		er := http.StatusMethodNotAllowed
+		http.Error(w, "Método de solicitação inválido.", er)
+		return
+	}
+
+	if err := Authorize(r); err != nil {
+		er := http.StatusUnauthorized
+		http.Error(w, "Não autorizado.", er)
+		return
+	}
+
+	username := r.FormValue("username")
+	fmt.Fprintf(w, "Validação CSRF concluída com sucesso! Bem-vindo %s", username)
+}
+
+func logout(w http.ResponseWriter, r *http.Request) {
+	if err := Authorize(r); err != nil {
+		er := http.StatusUnauthorized
+		http.Error(w, "Não autorizado.", er)
+		return
+	}
+
+	// Limpar cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Expires:  time.Now().Add(-time.Hour),
+		HttpOnly: true,
+	})
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Expires:  time.Now().Add(-time.Hour),
+		HttpOnly: false,
+	})
+
+	// Limpar cookies do banco de dados
+	username := r.FormValue("username")
+	user, _ := users[username]
+	user.SessionToken = ""
+	user.CSRFToken = ""
+	users[username] = user
+
+	fmt.Fprintln(w, "Desconectado com sucesso!")
+
+}
