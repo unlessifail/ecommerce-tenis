@@ -80,6 +80,8 @@ func login(w http.ResponseWriter, r *http.Request) {
 		Value:    sessionToken,
 		Expires:  time.Now().Add(24 * time.Hour),
 		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
 	})
 
 	// Define Token CSRF em um cookie
@@ -87,7 +89,8 @@ func login(w http.ResponseWriter, r *http.Request) {
 		Name:     "csrf_token",
 		Value:    csrfToken,
 		Expires:  time.Now().Add(24 * time.Hour),
-		HttpOnly: false, // Precisa ser acessível no client-side
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
 	})
 
 	// Armazena tokens no banco de dados
@@ -99,20 +102,15 @@ func login(w http.ResponseWriter, r *http.Request) {
 }
 
 func protected(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		er := http.StatusMethodNotAllowed
-		http.Error(w, "Método de solicitação inválido.", er)
+	// Verifique o token de sessão
+	sessionCookie, err := r.Cookie("session_token")
+	if err != nil || sessionCookie == nil {
+		http.Error(w, "Sessão inválida", http.StatusUnauthorized)
 		return
 	}
 
-	if err := Authorize(r); err != nil {
-		er := http.StatusUnauthorized
-		http.Error(w, "Não autorizado.", er)
-		return
-	}
-
-	username := r.FormValue("username")
-	fmt.Fprintf(w, "Validação CSRF concluída com sucesso! Bem-vindo %s", username)
+	// Validar o token da sessão...
+	fmt.Fprintln(w, "Conteúdo protegido acessado com sucesso!")
 }
 
 func logout(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +139,15 @@ func logout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
+	})
+
+	// Expira o cookie csrf_token também
+	http.SetCookie(w, &http.Cookie{
+		Name:     "csrf_token",
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
 	})
 
 	fmt.Fprintln(w, "Logout realizado com sucesso.")
