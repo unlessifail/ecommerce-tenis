@@ -1,15 +1,21 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// Struct Produto ajustada com campo opcional CriadoEm
+// ==================== MODELOS =====================
+
 type Produto struct {
 	ProductID  int       `json:"product_id"`
 	Nome       string    `json:"nome"`
@@ -23,219 +29,266 @@ type Produto struct {
 	CriadoEm   time.Time `json:"created_at,omitempty"`
 }
 
-// Struct para respostas padronizadas
 type Response struct {
 	Status  string      `json:"status"`
 	Message string      `json:"message,omitempty"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// Banco de dados em memória
-var produtos []Produto
-var nextID = 1
+type ItemCarrinho struct {
+	ProductID  int
+	Nome       string
+	Preco      float64
+	Quantidade int
+	Tamanho    string
+}
+
+type Login struct {
+	HashedPassword string
+	SessionToken   string
+	CSRFToken      string
+}
+
+// ==================== VARIÁVEIS GLOBAIS =====================
+
+var (
+	produtos  []Produto
+	nextID    = 1
+	carrinhos = map[string][]ItemCarrinho{} // session_token -> itens
+	users     = map[string]Login{}
+)
+
+// ==================== MAIN =====================
 
 func main() {
 	r := gin.Default()
 
-	// Rotas CRUD
+	// Rotas de Autenticação
+	r.POST("/register", register)
+	r.POST("/login", login)
+	r.POST("/logout", logout)
+
+	// Rota protegida (exemplo)
+	r.GET("/protected", protected)
+
+	// Rotas CRUD de Produtos
 	r.GET("/produtos", listProdutos)
 	r.GET("/produtos/:id", getProduto)
 	r.POST("/produtos", createProduto)
 	r.PUT("/produtos/:id", updateProduto)
 	r.DELETE("/produtos/:id", deleteProduto)
 
-	http.HandleFunc("/cart/add", addToCart)
-	http.HandleFunc("/cart/view", viewCart)
-	http.HandleFunc("/cart/remove", removeFromCart)
-	http.HandleFunc("/cart/checkout", checkout)
+	// Carrinho
+	r.POST("/cart/add", addToCart)
+	r.GET("/cart/view", viewCart)
+	r.POST("/cart/remove", removeFromCart)
+	r.POST("/cart/checkout", checkout)
 
 	r.Run(":8080")
 }
 
-// Listar todos os produtos
+// ==================== AUTH CONTROLLERS =====================
+
+func register(c *gin.Context) {
+	username := c.PostForm("username")
+	password := c.PostForm("password")
+
+	if len(username) < 8 || len(password) < 8 {
+		c.JSON(http.StatusNotAcceptable, gin.H{"message": "Usuário ou senha inválidos."})
+		return
+	}
+
+	if _, exists := users[username]; exists {
+		c.JSON(http.StatusConflict, gin.H{"message": "Usuário já existente."})
+		return
+	}
+
+	hashedPassword, _ := hashPassword(password)
+	users[username] = Login{
+		HashedPassword: hashedPassword,
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "Usuário registrado com sucesso!"})
+}
+
+func login(c *gin.Context) {
+	username := c.PostForm("username")
+	password := c.PostForm("password")
+
+	user, exists := users[username]
+	if !exists || !checkPasswordHash(password, user.HashedPassword) {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "Usuário ou senha incorretos."})
+		return
+	}
+
+	sessionToken := generateToken(32)
+	csrfToken := generateToken(32)
+
+	// Cookies
+	c.SetCookie("session_token", sessionToken, 86400, "/", "", true, true)
+	c.SetCookie("csrf_token", csrfToken, 86400, "/", "", false, true)
+	c.SetCookie("username", username, 86400, "/", "", false, true)
+
+	// Atualizar user tokens
+	user.SessionToken = sessionToken
+	user.CSRFToken = csrfToken
+	users[username] = user
+
+	c.JSON(http.StatusOK, gin.H{"message": "Login realizado com sucesso!"})
+}
+
+func logout(c *gin.Context) {
+	sessionToken, err := c.Cookie("session_token")
+	if err != nil || sessionToken == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "Sem sessão ativa."})
+		return
+	}
+
+	// Limpar sessão
+	for username, user := range users {
+		if user.SessionToken == sessionToken {
+			user.SessionToken = ""
+			user.CSRFToken = ""
+			users[username] = user
+			break
+		}
+	}
+
+	// Expira cookies
+	c.SetCookie("session_token", "", -1, "/", "", true, true)
+	c.SetCookie("csrf_token", "", -1, "/", "", false, true)
+	c.SetCookie("username", "", -1, "/", "", false, true)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Logout realizado com sucesso!"})
+}
+
+func protected(c *gin.Context) {
+	if err := Authorize(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Conteúdo protegido acessado com sucesso!"})
+}
+
+// ==================== PRODUTOS CONTROLLERS =====================
+
 func listProdutos(c *gin.Context) {
-	response := Response{
+	c.JSON(http.StatusOK, Response{
 		Status:  "success",
 		Message: "Lista de produtos recuperada com sucesso",
 		Data:    produtos,
-	}
-	c.JSON(http.StatusOK, response)
+	})
 }
 
-// Obter um produto por ID
 func getProduto(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		response := Response{
-			Status:  "error",
-			Message: "ID inválido. Por favor, forneça um número inteiro.",
-		}
-		c.JSON(http.StatusBadRequest, response)
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: "ID inválido."})
 		return
 	}
 
 	for _, p := range produtos {
 		if p.ProductID == id {
-			response := Response{
-				Status:  "success",
-				Message: "Produto encontrado",
-				Data:    p,
-			}
-			c.JSON(http.StatusOK, response)
+			c.JSON(http.StatusOK, Response{Status: "success", Data: p})
 			return
 		}
 	}
 
-	response := Response{
-		Status:  "error",
-		Message: "Produto não encontrado com o ID fornecido.",
-	}
-	c.JSON(http.StatusNotFound, response)
+	c.JSON(http.StatusNotFound, Response{Status: "error", Message: "Produto não encontrado."})
 }
 
-// Criar um novo produto
 func createProduto(c *gin.Context) {
-	var novoProduto Produto
-	if err := c.ShouldBindJSON(&novoProduto); err != nil {
-		response := Response{
-			Status:  "error",
-			Message: "Erro ao processar os dados: " + err.Error(),
-		}
-		c.JSON(http.StatusBadRequest, response)
+	var novo Produto
+	if err := c.ShouldBindJSON(&novo); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: err.Error()})
 		return
 	}
 
-	novoProduto.ProductID = nextID
-	novoProduto.CriadoEm = time.Now() // Adiciona timestamp de criação
-	nextID++
-	produtos = append(produtos, novoProduto)
-
-	response := Response{
-		Status:  "success",
-		Message: "Produto criado com sucesso",
-		Data:    novoProduto,
+	// Validação adicional
+	if novo.Preco <= 0 {
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: "O preço deve ser positivo."})
+		return
 	}
-	c.JSON(http.StatusCreated, response)
+	if novo.QtdEstoque < 0 {
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: "A quantidade em estoque não pode ser negativa."})
+		return
+	}
+
+	novo.ProductID = nextID
+	novo.CriadoEm = time.Now()
+	nextID++
+	produtos = append(produtos, novo)
+
+	c.JSON(http.StatusCreated, Response{Status: "success", Data: novo})
 }
 
-// Atualizar um produto
 func updateProduto(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		response := Response{
-			Status:  "error",
-			Message: "ID inválido. Por favor, forneça um número inteiro.",
-		}
-		c.JSON(http.StatusBadRequest, response)
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: "ID inválido."})
 		return
 	}
 
-	var produtoAtualizado Produto
-	if err := c.ShouldBindJSON(&produtoAtualizado); err != nil {
-		response := Response{
-			Status:  "error",
-			Message: "Erro ao processar os dados: " + err.Error(),
-		}
-		c.JSON(http.StatusBadRequest, response)
+	var atualizado Produto
+	if err := c.ShouldBindJSON(&atualizado); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: err.Error()})
 		return
 	}
 
 	for i, p := range produtos {
 		if p.ProductID == id {
-			produtoAtualizado.ProductID = id
-			produtoAtualizado.CriadoEm = p.CriadoEm // Mantém o timestamp original
-			produtos[i] = produtoAtualizado
-			response := Response{
-				Status:  "success",
-				Message: "Produto atualizado com sucesso",
-				Data:    produtoAtualizado,
-			}
-			c.JSON(http.StatusOK, response)
+			atualizado.ProductID = id
+			atualizado.CriadoEm = p.CriadoEm
+			produtos[i] = atualizado
+			c.JSON(http.StatusOK, Response{Status: "success", Data: atualizado})
 			return
 		}
 	}
 
-	response := Response{
-		Status:  "error",
-		Message: "Produto não encontrado com o ID fornecido.",
-	}
-	c.JSON(http.StatusNotFound, response)
+	c.JSON(http.StatusNotFound, Response{Status: "error", Message: "Produto não encontrado."})
 }
 
-// Deletar um produto
 func deleteProduto(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		response := Response{
-			Status:  "error",
-			Message: "ID inválido. Por favor, forneça um número inteiro.",
-		}
-		c.JSON(http.StatusBadRequest, response)
+		c.JSON(http.StatusBadRequest, Response{Status: "error", Message: "ID inválido."})
 		return
 	}
 
 	for i, p := range produtos {
 		if p.ProductID == id {
 			produtos = append(produtos[:i], produtos[i+1:]...)
-			response := Response{
-				Status:  "success",
-				Message: "Produto deletado com sucesso",
-				Data:    nil,
-			}
-			c.JSON(http.StatusOK, response)
+			c.JSON(http.StatusOK, Response{Status: "success", Message: "Produto deletado."})
 			return
 		}
 	}
 
-	response := Response{
-		Status:  "error",
-		Message: "Produto não encontrado com o ID fornecido.",
-	}
-	c.JSON(http.StatusNotFound, response)
+	c.JSON(http.StatusNotFound, Response{Status: "error", Message: "Produto não encontrado."})
 }
 
-// Carrinho de Compras
-type ItemCarrinho struct {
-	ProductID  int
-	Nome       string
-	Preço      float64
-	Quantidade int
-	Tamanho    string
-}
+// ==================== CARRINHO CONTROLLERS =====================
 
-var carrinhos = map[string][]ItemCarrinho{} // Chaveada pelo session_token
-
-// Adicionar ao Carrinho
-func addToCart(w http.ResponseWriter, r *http.Request) {
-	sessionCookie, err := r.Cookie("session_token")
-	if err != nil || sessionCookie.Value == "" {
-		http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
+func addToCart(c *gin.Context) {
+	if err := Authorize(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
-	sessionToken := sessionCookie.Value
+	sessionToken, _ := c.Cookie("session_token")
 
-	// Recebendo dados do produto
-	productIDStr := r.FormValue("product_id")
-	quantityStr := r.FormValue("quantity")
-	tamanho := r.FormValue("tamanho")
+	productID, _ := strconv.Atoi(c.PostForm("product_id"))
+	quantity, _ := strconv.Atoi(c.PostForm("quantity"))
+	tamanho := c.PostForm("tamanho")
 
-	productID, err := strconv.Atoi(productIDStr)
-	if err != nil {
-		http.Error(w, "ID do produto inválido", http.StatusBadRequest)
+	if quantity <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Quantidade inválida."})
 		return
 	}
 
-	quantity, err := strconv.Atoi(quantityStr)
-	if err != nil || quantity <= 0 {
-		http.Error(w, "Quantidade inválida", http.StatusBadRequest)
-		return
-	}
-
-	// Buscar o produto no slice de produtos
 	var produto Produto
 	encontrado := false
-	for _, p := range produtos { // produtos o slice retornado do /produtos
+	for _, p := range produtos {
 		if p.ProductID == productID {
 			produto = p
 			encontrado = true
@@ -244,71 +297,58 @@ func addToCart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !encontrado {
-		http.Error(w, "Produto não encontrado", http.StatusNotFound)
+		c.JSON(http.StatusNotFound, gin.H{"message": "Produto não encontrado."})
 		return
 	}
 
 	item := ItemCarrinho{
 		ProductID:  produto.ProductID,
 		Nome:       produto.Nome,
-		Preço:      produto.Preco,
+		Preco:      produto.Preco,
 		Quantidade: quantity,
 		Tamanho:    tamanho,
 	}
 
-	// Adiciona ao carrinho do usuário
 	carrinhos[sessionToken] = append(carrinhos[sessionToken], item)
 
-	fmt.Fprintf(w, "Produto %s adicionado ao carrinho!\n", produto.Nome)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Produto %s adicionado ao carrinho!", produto.Nome)})
 }
 
-// Ver carrinho
-func viewCart(w http.ResponseWriter, r *http.Request) {
-	sessionCookie, err := r.Cookie("session_token")
-	if err != nil || sessionCookie.Value == "" {
-		http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
+func viewCart(c *gin.Context) {
+	if err := Authorize(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
-	sessionToken := sessionCookie.Value
+	sessionToken, _ := c.Cookie("session_token")
+	cart := carrinhos[sessionToken]
 
-	cart, ok := carrinhos[sessionToken]
-	if !ok || len(cart) == 0 {
-		fmt.Fprintln(w, "Seu carrinho está vazio.")
+	if len(cart) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "Carrinho vazio."})
 		return
 	}
 
 	total := 0.0
 	for _, item := range cart {
-		fmt.Fprintf(w, "Produto: %s | Quantidade: %d | Tamanho: %s | Preço Unitário: %.2f\n", item.Nome, item.Quantidade, item.Tamanho, item.Preço)
-		total += item.Preço * float64(item.Quantidade)
+		total += item.Preco * float64(item.Quantidade)
 	}
 
-	fmt.Fprintf(w, "\nTotal: R$ %.2f", total)
+	c.JSON(http.StatusOK, gin.H{
+		"itens": cart,
+		"total": fmt.Sprintf("R$ %.2f", total),
+	})
 }
 
-// Remover produto do carrinho
-func removeFromCart(w http.ResponseWriter, r *http.Request) {
-	sessionCookie, err := r.Cookie("session_token")
-	if err != nil || sessionCookie.Value == "" {
-		http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
+func removeFromCart(c *gin.Context) {
+	if err := Authorize(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
-	sessionToken := sessionCookie.Value
+	sessionToken, _ := c.Cookie("session_token")
 
-	productIDStr := r.FormValue("product_id")
-	productID, err := strconv.Atoi(productIDStr)
-	if err != nil {
-		http.Error(w, "ID do produto inválido", http.StatusBadRequest)
-		return
-	}
-
-	cart, ok := carrinhos[sessionToken]
-	if !ok || len(cart) == 0 {
-		http.Error(w, "Carrinho vazio", http.StatusBadRequest)
-		return
-	}
+	productID, _ := strconv.Atoi(c.PostForm("product_id"))
+	cart := carrinhos[sessionToken]
 
 	newCart := []ItemCarrinho{}
 	for _, item := range cart {
@@ -319,31 +359,75 @@ func removeFromCart(w http.ResponseWriter, r *http.Request) {
 
 	carrinhos[sessionToken] = newCart
 
-	fmt.Fprintln(w, "Produto removido do carrinho.")
+	c.JSON(http.StatusOK, gin.H{"message": "Produto removido do carrinho."})
 }
 
-// Finalizar compra
-func checkout(w http.ResponseWriter, r *http.Request) {
-	sessionCookie, err := r.Cookie("session_token")
-	if err != nil || sessionCookie.Value == "" {
-		http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
+func checkout(c *gin.Context) {
+	if err := Authorize(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
-	sessionToken := sessionCookie.Value
-	cart, ok := carrinhos[sessionToken]
-	if !ok || len(cart) == 0 {
-		http.Error(w, "Carrinho vazio", http.StatusBadRequest)
+	sessionToken, _ := c.Cookie("session_token")
+	cart := carrinhos[sessionToken]
+
+	if len(cart) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Carrinho vazio."})
 		return
 	}
 
 	total := 0.0
 	for _, item := range cart {
-		total += item.Preço * float64(item.Quantidade)
+		total += item.Preco * float64(item.Quantidade)
 	}
 
-	// Aqui faremos a lógica de pagamento
-	delete(carrinhos, sessionToken) // Limpa o carrinho
+	delete(carrinhos, sessionToken)
 
-	fmt.Fprintf(w, "Compra finalizada com sucesso! Total: R$ %.2f\n", total)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Compra finalizada! Total: R$ %.2f", total)})
+}
+
+// ==================== MIDDLEWARES E UTILS =====================
+
+var AuthError = errors.New("Não autorizado.")
+
+func Authorize(c *gin.Context) error {
+	username, err := c.Cookie("username")
+	if err != nil {
+		return AuthError
+	}
+
+	user, ok := users[username]
+	if !ok {
+		return AuthError
+	}
+
+	st, err := c.Cookie("session_token")
+	if err != nil || st != user.SessionToken {
+		return AuthError
+	}
+
+	csrf := c.GetHeader("X-CSRF-Token")
+	if csrf != user.CSRFToken || csrf == "" {
+		return AuthError
+	}
+
+	return nil
+}
+
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 10)
+	return string(bytes), err
+}
+
+func checkPasswordHash(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+
+func generateToken(length int) string {
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		log.Fatalf("Erro ao gerar token: %v", err)
+	}
+	return base64.URLEncoding.EncodeToString(bytes)
 }
